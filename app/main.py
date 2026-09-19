@@ -1,13 +1,16 @@
-"""FastAPI 入口：化学方程式精确配平 + 化学计量 API。"""
+"""FastAPI 入口：化学方程式精确配平 + 化学计量 + 经验式推断 API。"""
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 
 from .balancer import BalanceError, balance_equation, verify_coefficients
+from .formula_infer import FormulaInferError, NoSolutionError, infer_formula
 from .parser import FormulaError
 from .schemas import (
     BalanceRequest,
     BalanceResponse,
+    FormulaInferRequest,
+    FormulaInferResponse,
     StoichiometryRequest,
     StoichiometryResponse,
     VerifyRequest,
@@ -20,9 +23,10 @@ app = FastAPI(
     description=(
         "基于元素守恒矩阵（含电荷行）与有理数高斯消元零空间的精确配平服务。"
         "支持嵌套括号、点号结晶水与末尾离子电荷；并提供基于内置原子量表的"
-        "化学计量计算（限制反应物、理论产量与剩余量）。"
+        "化学计量计算（限制反应物、理论产量与剩余量），以及由元素质量百分比"
+        "反推经验式/分子式的推断接口。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -113,3 +117,30 @@ def stoichiometry(req: StoichiometryRequest) -> dict:
         ) from exc
     except StoichiometryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/formula/infer",
+    response_model=FormulaInferResponse,
+    tags=["formula"],
+    summary="由元素质量百分比反推经验式/分子式",
+    responses={
+        400: {
+            "description": (
+                "百分比非正数、总和与 100 的偏差超过 tolerance、"
+                "元素无内置原子量，或实测摩尔质量非正数"
+            )
+        },
+        422: {"description": "容差内无合格候选式，或摩尔质量无匹配的正整数倍"},
+    },
+)
+def formula_infer(req: FormulaInferRequest) -> dict:
+    try:
+        return infer_formula(req.percentages, req.tolerance, req.molar_mass, req.precision)
+    except FormulaInferError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except NoSolutionError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": exc.message, **exc.context},
+        ) from exc

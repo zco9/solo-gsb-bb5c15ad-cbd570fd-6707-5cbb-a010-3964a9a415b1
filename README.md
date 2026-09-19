@@ -4,6 +4,8 @@
 
 另提供**化学计量接口**：在配平结果基础上，按内置原子量表（H、C、N、O、Na、Mg、Al、S、Cl、K、Ca、Fe、Cu、Mn）换算投料物质的量，以反应进度最小值判定（可并列的）限制反应物，返回理论反应进度、各生成物理论产量与各反应物剩余量。全程 `Decimal` 计算，输出按请求 `precision` 四舍五入。
 
+以及**经验式推断接口**：由元素质量百分比反推经验式——先按内置原子量表换算摩尔比，再在 1～12 倍尺度内生成互质正整数下标候选，用候选式反算理论百分比并保留最大绝对偏差不超过 `tolerance` 者（并列时依次取总原子数较少、Hill 顺序字符串较小者）；提供实测摩尔质量时，按最接近的正整数倍给出分子式。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -156,6 +158,69 @@ curl -s http://localhost:8000/api/v1/stoichiometry \
 | `400` | 化学式无法解析；缺失投料；同一物质重复投料；投料量非正数；投料物质不是反应物；元素无内置原子量 |
 | `422` | 方程无法配平（零空间维数不为 1 或无法全正）；单位不是 `mol`/`g`；`precision` 超出 2～8 |
 
+### `POST /api/v1/formula/infer` — 经验式/分子式推断
+
+由元素质量百分比反推经验式：按内置原子量表把百分比换算为摩尔比，在 **1～12 倍尺度**内四舍五入并约简为**互质正整数下标**候选；用候选式反算各元素理论百分比，保留**最大绝对偏差 ≤ `tolerance`** 的候选，偏差最小者胜出（并列时依次取总原子数较少、Hill 顺序字符串较小者）。提供 `molar_mass` 时，取**最接近实测值的正整数倍**作为分子式，其相对偏差（%）同样须 ≤ `tolerance`。
+
+- 百分比须均为正数，且总和与 100 的偏差不超过 `tolerance`（默认 `0.5`，单位：百分点）。
+- 元素须在内置原子量表内（同化学计量接口）。
+- 所有小数字段按 `precision`（2～8，默认 4）四舍五入为**定长小数字符串**返回。
+
+```bash
+curl -s http://localhost:8000/api/v1/formula/infer \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "percentages": {"C": 40.0, "H": 6.7, "O": 53.3},
+        "molar_mass": 180.0
+      }'
+```
+
+响应（`200`）：
+
+```json
+{
+  "empirical_formula": "CH2O",
+  "subscripts": {"C": 1, "H": 2, "O": 1},
+  "theoretical_percentages": {"C": "40.0020", "H": "6.7142", "O": "53.2838"},
+  "deviations": {"C": "0.0020", "H": "0.0142", "O": "0.0162"},
+  "max_deviation": "0.0162",
+  "empirical_molar_mass": "30.0260",
+  "molecular_formula": "C6H12O6",
+  "multiplier": 6,
+  "molecular_molar_mass": "180.1560",
+  "molar_mass_relative_deviation": "0.0867"
+}
+```
+
+不提供 `molar_mass` 时，分子式相关字段为 `null`：
+
+```bash
+curl -s http://localhost:8000/api/v1/formula/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"percentages": {"N": 36.86, "O": 63.14}, "tolerance": 0.5}'
+# -> empirical_formula: N2O3（尺度 2 的候选比尺度 1 的 NO2 偏差更小）
+```
+
+错误返回：
+
+| 状态码 | 场景 |
+| --- | --- |
+| `400` | 百分比非正数；百分比总和与 100 的偏差超过 `tolerance`；元素无内置原子量；`molar_mass` 非正数 |
+| `422` | 1～12 倍尺度内无候选式满足容差；摩尔质量无满足相对偏差容差的正整数倍；`tolerance` 为负；`precision` 超出 2～8 |
+
+`422` 响应的 `detail` 附带诊断信息（最接近的候选式及其偏差，或摩尔质量倍数与相对偏差），例如：
+
+```json
+{
+  "detail": {
+    "message": "1～12 倍尺度内无候选式满足最大绝对偏差 ≤ tolerance=0.5",
+    "tolerance": "0.5",
+    "nearest_candidate": "CO",
+    "nearest_max_deviation": "0.8811"
+  }
+}
+```
+
 ## 本地开发
 
 ```bash
@@ -171,8 +236,9 @@ app/
   parser.py         # 分子式解析：嵌套括号、结晶水、离子电荷
   balancer.py       # 守恒矩阵（含电荷行）、有理数 RREF、零空间、整数化
   stoichiometry.py  # 内置原子量表、投料换算、限制反应物、产量与剩余量（Decimal）
+  formula_infer.py  # 质量百分比 → 摩尔比 → 互质下标候选 → 经验式/分子式推断（Decimal）
   schemas.py        # 请求/响应模型
   main.py           # FastAPI 路由
-tests/test_api.py / tests/test_stoichiometry.py
+tests/test_api.py / tests/test_stoichiometry.py / tests/test_formula_infer.py
 Dockerfile / docker-compose.yml
 ```
