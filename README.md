@@ -4,6 +4,8 @@
 
 另提供**化学计量接口**：在配平结果基础上，按内置原子量表（H、C、N、O、Na、Mg、Al、S、Cl、K、Ca、Fe、Cu、Mn）换算投料物质的量，以反应进度最小值判定（可并列的）限制反应物，返回理论反应进度、各生成物理论产量与各反应物剩余量。全程 `Decimal` 计算，输出按请求 `precision` 四舍五入。
 
+还提供**经验式反推接口**：由元素质量百分比按原子量换算摩尔比，在 1～12 倍尺度内枚举互质正整数下标作为经验式候选，反算理论质量百分比择优；可选结合实测摩尔质量确定分子式。
+
 ## 快速启动（单条命令）
 
 ```bash
@@ -156,6 +158,84 @@ curl -s http://localhost:8000/api/v1/stoichiometry \
 | `400` | 化学式无法解析；缺失投料；同一物质重复投料；投料量非正数；投料物质不是反应物；元素无内置原子量 |
 | `422` | 方程无法配平（零空间维数不为 1 或无法全正）；单位不是 `mol`/`g`；`precision` 超出 2～8 |
 
+### `POST /api/v1/formula/infer` — 反推经验式 / 分子式
+
+由元素**质量百分比**反推经验式，提供实测摩尔质量时进一步给出分子式。
+
+- 算法：各元素百分比除以内置原子量得摩尔比，以最小摩尔值归一；在 **1～12 倍尺度**内四舍五入为正整数下标，仅保留**互质**（gcd = 1）下标作为经验式候选。
+- 候选反算各元素理论质量百分比，要求**最大绝对偏差**（百分点）不超过请求 `tolerance`（默认 `0.1`，必须为正）；偏差相同时依次取**总原子数较少**、**Hill 顺序字符串较小**者；无合格候选返回 `422`。
+- 输入百分比均须为**正数**，且总和与 `100` 的绝对偏差不超过 `tolerance`，否则返回 `400`；元素须在内置原子量表内。
+- 提供 `molar_mass` 时，取 `实测值 / 经验式摩尔质量` **最接近的正整数倍** n 确定分子式（理论值 = n × 经验式摩尔质量），其与实测值的**相对偏差不得超过 `tolerance`%**，否则 `422`。
+- 化学式按 **Hill 系统**输出（含碳时 C、H 在前，其余字母序；不含碳时全部字母序）；所有小数字段四舍五入为 6 位小数字符串。
+
+仅反推经验式（如 Fe 69.94% / O 30.06%，摩尔比约 1:1.5，需放大到尺度 2）：
+
+```bash
+curl -s http://localhost:8000/api/v1/formula/infer \
+  -H 'Content-Type: application/json' \
+  -d '{"elements": {"Fe": "69.94", "O": "30.06"}, "tolerance": 0.1}'
+```
+
+响应（`200`）：
+
+```json
+{
+  "empirical_formula": "Fe2O3",
+  "subscripts": {"Fe": 2, "O": 3},
+  "formula_scale": 2,
+  "total_atoms": 5,
+  "elements": [
+    {"element": "Fe", "subscript": 2, "given_percent": "69.940000",
+     "theoretical_percent": "69.943076", "deviation": "0.003076"},
+    {"element": "O", "subscript": 3, "given_percent": "30.060000",
+     "theoretical_percent": "30.056924", "deviation": "-0.003076"}
+  ],
+  "max_abs_deviation": "0.003076",
+  "empirical_molar_mass": "159.687000",
+  "measured_molar_mass": null,
+  "molecular_multiplier": null,
+  "molecular_formula": null,
+  "molecular_molar_mass": null,
+  "molar_mass_relative_deviation_percent": null
+}
+```
+
+结合实测摩尔质量确定分子式（葡萄糖：经验式 CH₂O，M = 30.026，实测 180.16 → n = 6）：
+
+```bash
+curl -s http://localhost:8000/api/v1/formula/infer \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "elements": {"H": "6.71", "C": "40.00", "O": "53.29"},
+        "tolerance": 0.1,
+        "molar_mass": 180.16
+      }'
+```
+
+响应（`200`，节选）：
+
+```json
+{
+  "empirical_formula": "CH2O",
+  "subscripts": {"C": 1, "H": 2, "O": 1},
+  "formula_scale": 1,
+  "max_abs_deviation": "0.006179",
+  "empirical_molar_mass": "30.026000",
+  "measured_molar_mass": "180.160000",
+  "molecular_multiplier": 6,
+  "molecular_formula": "C6H12O6",
+  "molecular_molar_mass": "180.156000",
+  "molar_mass_relative_deviation_percent": "0.002220"
+}
+```
+
+错误返回：
+
+| 状态码 | 场景 |
+| --- | --- |
+| `400` | `elements` 为空；存在表外元素；百分比非正或非有限数；百分比总和与 100 的偏差超过 `tolerance`；`tolerance`/`molar_mass` 非正 |
+| `422` | 1～12 尺度内无最大绝对偏差不超过 `tolerance` 的候选；提供摩尔质量时最近正整数倍的相对偏差超过 `tolerance`%；字段类型/缺失等模型校验错误 |
+
 ## 本地开发
 
 ```bash
@@ -171,8 +251,9 @@ app/
   parser.py         # 分子式解析：嵌套括号、结晶水、离子电荷
   balancer.py       # 守恒矩阵（含电荷行）、有理数 RREF、零空间、整数化
   stoichiometry.py  # 内置原子量表、投料换算、限制反应物、产量与剩余量（Decimal）
+  formula_infer.py  # 质量百分比反推经验式、摩尔质量定分子式（Decimal）
   schemas.py        # 请求/响应模型
   main.py           # FastAPI 路由
-tests/test_api.py / tests/test_stoichiometry.py
+tests/test_api.py / tests/test_stoichiometry.py / tests/test_formula_infer.py
 Dockerfile / docker-compose.yml
 ```
